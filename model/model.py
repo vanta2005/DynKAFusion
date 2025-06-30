@@ -1,8 +1,9 @@
 # flake8: noqa
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import torch.nn.init as init
 
 class _ConvBNReLU(nn.Module):
 
@@ -1004,44 +1005,264 @@ class HighResolutionBranch(nn.Module):
 
         return x
 
+class KANConvs(nn.Module):
+    """
+    定义KAN卷积层，类似于nn.Conv2d，但叠加了一组可学习的样条插值卷积
+    输出 = 标准卷积 + 样条卷积 * 可选缩放系数
+    """
+    def __init__(self,
+                 in_channels, 
+                 out_channels, 
+                 kernel_size, 
+                 stride=1, 
+                 padding=0, 
+                 dilation=1, 
+                 groups=1, 
+                 bias=True, 
+                 enable_standalone_scale_spline=True):
+        super(KANConvs, self).__init__()
+        
+        # 基础参数
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.kernel_size  = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.stride       = stride
+        self.padding      = padding
+        self.dilation     = dilation
+        self.groups       = groups
+        self.use_bias     = bias
+        self.enable_standalone = enable_standalone_scale_spline
+
+        # 标准卷积参数
+        self.weight = nn.Parameter(torch.Tensor(
+            out_channels, in_channels // groups, *self.kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        # 样条插值卷积参数
+        # 这里不使用 groups，为了对所有输入通道做全连接样条插值
+        self.spline_weight = nn.Parameter(torch.Tensor(
+            out_channels, in_channels, *self.kernel_size))
+        if self.enable_standalone:
+            # 每个输出通道一个缩放系数
+            self.spline_scaler = nn.Parameter(torch.ones(out_channels, 1))
+
+        # 权重初始化
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # 仿照 nn.Conv2d 的 kaiming 初始化
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.use_bias:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            init.uniform_(self.bias, -bound, bound)
+
+        # spline 权重同样用 kaiming 初始化
+        init.kaiming_uniform_(self.spline_weight, a=math.sqrt(5))
+        if self.enable_standalone:
+            # 已在 __init__ 里设为 ones，这里确保初始化一致
+            init.ones_(self.spline_scaler)
+
+    def forward(self, x):
+        # 标准卷积
+        std_out = F.conv2d(
+            x, 
+            self.weight, 
+            bias=self.bias if self.use_bias else None,
+            stride=self.stride, 
+            padding=self.padding, 
+            dilation=self.dilation, 
+            groups=self.groups
+        )
+
+        # 样条插值卷积（不带 bias）
+        spline_out = F.conv2d(
+            x, 
+            self.spline_weight, 
+            bias=None,
+            stride=self.stride, 
+            padding=self.padding, 
+            dilation=self.dilation, 
+            groups=1
+        )
+
+        # 可选缩放
+        if self.enable_standalone:
+            # spline_scaler shape = (out_channels, 1)
+            # 调整为 (1, out_channels, 1, 1) 与卷积输出广播
+            scale = self.spline_scaler.view(1, -1, 1, 1)
+            spline_out = spline_out * scale
+
+        # 最终输出
+        return std_out + spline_out
+
+class BottleneckKANConvs(nn.Module):
+    """
+    瓶颈版 KAN 卷积层：
+      输入 → 1×1 压缩 → KAN 核心运算（mid→mid）→ 1×1 扩展 → 输出
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 bias=True,
+                 bottleneck_ratio=4,
+                 enable_standalone_scale_spline=True):
+        super().__init__()
+        # 中间通道数
+        mid_channels = max(1, in_channels // bottleneck_ratio)
+
+        # 1×1 压缩：in → mid
+        self.compress = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=bias)
+
+        # KAN 核心：mid → mid
+        self.weight = nn.Parameter(torch.Tensor(
+            mid_channels, mid_channels // groups, *self._pair(kernel_size)))
+        self.spline_weight = nn.Parameter(torch.Tensor(
+            mid_channels, mid_channels, *self._pair(kernel_size)))
+        if enable_standalone_scale_spline:
+            self.spline_scaler = nn.Parameter(torch.ones(mid_channels, 1))
+
+        # bias for KAN 核心
+        self.use_bias = bias
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(mid_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        # 1×1 扩展：mid → out
+        self.expand = nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=bias)
+
+        # 属性
+        self.stride   = stride
+        self.padding  = padding
+        self.dilation = dilation
+        self.groups   = groups
+        self.enable_standalone = enable_standalone_scale_spline
+
+        # 初始化所有权重
+        self.reset_parameters()
+
+    @staticmethod
+    def _pair(val):
+        return (val, val) if isinstance(val, int) else val
+
+    def reset_parameters(self):
+        # 初始化 compress & expand（与 nn.Conv2d 保持一致）
+        for m in (self.compress, self.expand):
+            init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                fan_in, _ = init._calculate_fan_in_and_fan_out(m.weight)
+                bound = 1 / math.sqrt(fan_in)
+                init.uniform_(m.bias, -bound, bound)
+        # 初始化 KAN 核心权重
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        init.kaiming_uniform_(self.spline_weight, a=math.sqrt(5))
+        if self.use_bias:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            init.uniform_(self.bias, -bound, bound)
+        if self.enable_standalone:
+            init.ones_(self.spline_scaler)
+
+    def forward(self, x):
+        # 1×1 压缩
+        x = self.compress(x)  # B x mid x H x W
+
+        # 标准卷积分支 (mid→mid)
+        std_out = F.conv2d(
+            x,
+            self.weight,
+            bias=self.bias if self.use_bias else None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
+        )
+        # 样条插值分支 (mid→mid)
+        spline_out = F.conv2d(
+            x,
+            self.spline_weight,
+            bias=None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=1
+        )
+        if self.enable_standalone:
+            scale = self.spline_scaler.view(1, -1, 1, 1)
+            spline_out = spline_out * scale
+
+        # 合并 KAN 输出，shape=B×mid×H×W
+        out_mid = std_out + spline_out
+
+        # 1×1 扩展到 out_channels
+        out = self.expand(out_mid)
+        return out
+
 
 # 添加KAN模块所需的内层函数
-class InnerFunction(nn.Module):
-    """KANs内层函数Ψ实现"""
+class InnerFunctionKAN(nn.Module):
+    """方案1：内层函数，第一层用原生KAN，后面用瓶颈版KAN"""
+    def __init__(self, in_dim, hidden_dim, out_dim, bottleneck_ratio=4):
+        super().__init__()
+        # Shortcut投影：用全参数 KANConvs（保留最大表达力）
+        self.proj = KANConvs(in_dim, out_dim, kernel_size=1, padding=0)
 
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super(InnerFunction, self).__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_dim, hidden_dim, 1), nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(), nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
-            nn.BatchNorm2d(hidden_dim), nn.ReLU(),
-            nn.Conv2d(hidden_dim, out_dim, 1))
+            # 第一层：原生 KANConvs
+            KANConvs(in_dim, hidden_dim, kernel_size=1, padding=0),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+
+            # 第二层及以后：瓶颈版
+            BottleneckKANConvs(hidden_dim, hidden_dim,
+                               kernel_size=3, padding=1,
+                               bottleneck_ratio=bottleneck_ratio),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+
+            BottleneckKANConvs(hidden_dim, out_dim,
+                               kernel_size=1, padding=0,
+                               bottleneck_ratio=bottleneck_ratio),
+        )
+
+    def forward(self, x):
+        return self.net(x) + self.proj(x)
+
+
+class OuterFunctionKAN(nn.Module):
+    """方案1：外层函数，第一层用原生KAN，第二层用瓶颈版"""
+    def __init__(self, in_dim, hidden_dim, out_dim, bottleneck_ratio=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            # 第一层：全参数版 KANConvs（1×1）
+            KANConvs(in_dim, hidden_dim, kernel_size=1, padding=0),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+
+            # 第二层：瓶颈版 KAN
+            BottleneckKANConvs(hidden_dim, out_dim,
+                               kernel_size=1, padding=0,
+                               bottleneck_ratio=bottleneck_ratio),
+        )
 
     def forward(self, x):
         return self.net(x)
 
 
-# 添加KAN模块所需的外层函数
-class OuterFunction(nn.Module):
-    """KANs外层函数Φ实现"""
-
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super(OuterFunction, self).__init__()
-        self.net = nn.Sequential(nn.Conv2d(in_dim, hidden_dim, 1),
-                                 nn.BatchNorm2d(hidden_dim), nn.ReLU(),
-                                 nn.Conv2d(hidden_dim, out_dim, 1))
-
-    def forward(self, x):
-        return self.net(x)
-
-
-# 添加改进的KANFusion用于两流特征融合
-# 修改KANFusion以适应新的高分辨率分支
-# 修改KANFusion以接收中间特征
-# 修改KANFusion的初始化
-# 双流融合网络：使用可学习的加权系数来动态调整不同特征流的融合比例
 class DynKANFusion(nn.Module):
-
+    """
+    双流融合网络：使用可学习的加权系数来动态调整不同特征流的融合比例，
+    内外层函数均已替换为KAN版本
+    """
     def __init__(self,
                  higher_dim=64,
                  lower_dim=128,
@@ -1049,54 +1270,56 @@ class DynKANFusion(nn.Module):
                  outer_dim=128):
         super(DynKANFusion, self).__init__()
 
-        # 高分辨率分支
-        self.high_res_branch = HighResolutionBranch(higher_dim,
-                                                    lower_dim,
-                                                    intermediate_channels=(64,
-                                                                           96))
+        # 高分辨率分支（保持不变）
+        self.high_res_branch = HighResolutionBranch(
+            in_channels=higher_dim,
+            out_channels=lower_dim,
+            intermediate_channels=(64, 96)
+        )
 
-        # 内层函数
-        self.inner_functions = nn.ModuleList(
-            [InnerFunction(lower_dim, inner_dim, outer_dim) for _ in range(2)])
+        # 内层函数：使用KAN实现
+        self.inner_functions = nn.ModuleList([
+            InnerFunctionKAN(lower_dim, inner_dim, outer_dim),
+            InnerFunctionKAN(lower_dim, inner_dim, outer_dim)
+        ])
 
-        # 外层函数
-        self.outer_function = OuterFunction(outer_dim, outer_dim // 2,
-                                            lower_dim)
+        # 外层函数：使用KAN实现
+        self.outer_function = OuterFunctionKAN(outer_dim, outer_dim // 2, lower_dim)
 
         # 可学习的加权系数
-        self.high_res_weight = nn.Parameter(torch.ones(1))  # 高分辨率流的权重
-        self.low_res_weight = nn.Parameter(torch.ones(1))  # 低分辨率流的权重
+        self.high_res_weight = nn.Parameter(torch.ones(1))
+        self.low_res_weight = nn.Parameter(torch.ones(1))
 
     def forward(self, higher_res, lower_res, intermediate_features):
-        h, w = higher_res.size()[2:]
+        h, w = higher_res.size(2), higher_res.size(3)
 
-        # 调整低分辨率特征大小
-        up_lower_res = F.interpolate(lower_res,
-                                     size=(h, w),
-                                     mode='bilinear',
-                                     align_corners=True)
-        lower_res_feats = [
-            F.interpolate(feat,
-                          size=(h, w),
-                          mode='bilinear',
-                          align_corners=True) for feat in intermediate_features
+        # 调整低分辨率特征大小到高分辨率尺寸
+        up_lower = F.interpolate(lower_res, size=(h, w), mode='bilinear', align_corners=True)
+        up_intermediates = [
+            F.interpolate(feat, size=(h, w), mode='bilinear', align_corners=True)
+            for feat in intermediate_features
         ]
 
-        # 通过高分辨率分支
-        higher_res = self.high_res_branch(higher_res, lower_res_feats)
+        # 高分辨率分支处理
+        high_feats = self.high_res_branch(higher_res, up_intermediates)
 
-        # 内层函数处理
-        inner_out1 = self.inner_functions[0](higher_res)
-        inner_out2 = self.inner_functions[1](up_lower_res)
+        # 内层函数处理：高流与低流
+        inner_high = self.inner_functions[0](high_feats)
+        inner_low = self.inner_functions[1](up_lower)
 
-        # 使用学习的权重对特征进行加权融合
-        weighted_inner_out1 = inner_out1 * self.high_res_weight
-        weighted_inner_out2 = inner_out2 * self.low_res_weight
+        # 加权融合
+        fused = inner_high * self.high_res_weight + inner_low * self.low_res_weight
 
-        # 特征融合
-        combined = weighted_inner_out1 + weighted_inner_out2
+        # 外层函数处理融合结果
+        out = self.outer_function(fused)
 
-        return self.outer_function(combined)
+        # 存储中间特征，便于调试或后续使用
+        self.inner_high = inner_high
+        self.inner_low = inner_low
+        self.fused = fused
+        self.out = out
+
+        return out
 
 
 class Deconv_BN_ACT(nn.Module):
@@ -1222,20 +1445,3 @@ class self_net(nn.Module):
         x = F.interpolate(x, size, mode='bilinear', align_corners=True)
 
         return x
-
-
-# 创建一个输入张量
-input_tensor = torch.randn(6, 3, 448, 448).cuda()  # 假设输入图像的尺寸为448x448，批量大小为6
-
-# 初始化模型
-model = self_net(n_classes=4).cuda()  # 假设有4个类别
-
-# 将模型设置为评估模式
-model.eval()
-
-# 前向传播
-with torch.no_grad():
-    output = model(input_tensor)
-
-# 打印输出张量的形状
-print("Output shape:", output.shape)
